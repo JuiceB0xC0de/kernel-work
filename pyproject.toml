@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-chaos-gms"
+version = "0.0.1"
+description = "Runtime gather-matmul-scatter overlay for deep_chaos_scheduler. In-progress kernel work; do not publish."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=2.1"]
+test = ["pytest>=7", "deep-chaos-scheduler"]
+
+[tool.setuptools.packages.find]
+include = ["deep_chaos_gms*"]
+exclude = ["tests*", "bench*"]
