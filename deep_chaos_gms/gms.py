@@ -302,6 +302,57 @@ class GatherMatmulScatterLinear(nn.Module):
 # ----- install / uninstall ---------------------------------------------------
 
 
+def _repair_binding_dims(binding) -> list[str]:
+    """Fix per-layer dimension metadata that the upstream binding inference
+    can get wrong on modern transformers attention modules.
+
+    Specifically: modern `Qwen2Attention` (transformers >= ~4.40) stores
+    `num_key_value_heads` only on `attn.config`, not on the module itself.
+    The upstream `_first_attr(attn, ("num_key_value_heads", ...))` returns
+    None for those modules, and `LayerBindings` then defaults
+    `num_kv_heads` to `num_heads`.  On a GQA model
+    (num_kv_heads != num_heads) this produces alive_k_out / alive_v_out
+    indices that overshoot the actual k_proj / v_proj output dim.
+
+    The published `_apply_last_dim_mask` silently filters
+    out-of-bounds indices, so the post-hook path "works" but at a
+    much lower effective KV survival rate than configured.
+    GMS's `index_select` cannot silently filter — ROCm
+    HSA-faults instead — so we have to repair the binding before
+    installing wrappers.
+
+    Returns the list of repair messages (empty when nothing was changed).
+    """
+    messages: list[str] = []
+    head_dim = int(binding.head_dim or 0)
+    if head_dim <= 0:
+        return messages
+
+    # Repair num_heads from q_proj.out_features // head_dim if available.
+    q = getattr(binding, "q_proj", None)
+    if isinstance(q, nn.Linear) and head_dim > 0:
+        derived_q = int(q.out_features // head_dim)
+        if derived_q > 0 and derived_q != int(binding.num_heads or 0):
+            messages.append(
+                f"layer {binding.layer_idx}: num_heads "
+                f"{binding.num_heads} -> {derived_q} (from q_proj)"
+            )
+            binding.num_heads = derived_q
+
+    # Repair num_kv_heads from k_proj.out_features // head_dim.
+    k = getattr(binding, "k_proj", None)
+    if isinstance(k, nn.Linear) and head_dim > 0:
+        derived_kv = int(k.out_features // head_dim)
+        if derived_kv > 0 and derived_kv != int(binding.num_kv_heads or 0):
+            messages.append(
+                f"layer {binding.layer_idx}: num_kv_heads "
+                f"{binding.num_kv_heads} -> {derived_kv} (from k_proj)"
+            )
+            binding.num_kv_heads = derived_kv
+
+    return messages
+
+
 def _projection_should_wrap(binding, component: str) -> bool:
     """Mirror the existing hook installer's gate on a per-component basis.
 
@@ -392,6 +443,31 @@ def enable_gms(
         raise RuntimeError(
             "enable_gms has already been called on this scheduler; call "
             "disable_gms first."
+        )
+
+    # Repair per-layer dimension metadata that the upstream binding
+    # inference may have gotten wrong (esp. num_kv_heads on modern Qwen2).
+    # Must happen BEFORE we drop the post-hooks or build wrappers, and
+    # BEFORE the next scheduler.step() generates a fresh topology.
+    repairs: list[str] = []
+    for binding in scheduler.bindings.values():
+        repairs.extend(_repair_binding_dims(binding))
+    if repairs:
+        # Force the next .step() to regenerate the topology with the corrected
+        # head counts.  Don't call .step() ourselves here — the user's first
+        # .step(global_step) will produce the right indices.
+        scheduler.cached_stats = None
+        scheduler.last_shuffle_step = None
+        scheduler.topologies.clear()
+        import warnings
+        warnings.warn(
+            "deep_chaos_gms.enable_gms repaired upstream binding metadata: "
+            + "; ".join(repairs)
+            + ". The published post-hook path silently filters out-of-bounds "
+            "alive indices; GMS cannot, so this repair is required for GMS "
+            "but also indicates the post-hook path was running at a lower "
+            "effective KV survival rate than configured.",
+            stacklevel=2,
         )
 
     # Drop the existing post-hooks but DO NOT call scheduler.remove() — that
