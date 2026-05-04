@@ -19,12 +19,30 @@ Public API: `enable_gms(scheduler)` and `disable_gms(scheduler)`.
 
 from __future__ import annotations
 
+import os
 import weakref
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _validate_enabled() -> bool:
+    """Validation mode: check every alive_* index against the projection's
+    actual dimensions before each forward.  Triggered by `DEEP_CHAOS_GMS_VALIDATE=1`.
+
+    Why this exists: ROCm 7.2's HIP `index_select` faults hard
+    (HSA_STATUS_ERROR_EXCEPTION) when any index >= dim_size, instead of
+    raising a clean error like CUDA.  If the upstream scheduler ever
+    produces an out-of-bounds index (e.g. via a head_dim/num_heads inference
+    mismatch on a model with split QKV dims), it manifests as a
+    `vectorized_gather_kernel` crash with no Python-side traceback to the
+    real cause.  This switch makes the bound check explicit and Pythonic.
+    """
+    return os.environ.get("DEEP_CHAOS_GMS_VALIDATE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 # Components hooked by the existing post-hook installer in
@@ -180,12 +198,18 @@ class GatherMatmulScatterLinear(nn.Module):
         # which under device_map="auto" can differ from this layer's actual
         # device.  Move per-forward; .to(...) on a same-device tensor is a
         # no-op so this is safe to do unconditionally.
-        alive_out = alive_out.to(device=x.device, non_blocking=True).long()
+        # NOTE: non_blocking=True can fault on ROCm with int64 index tensors
+        # if the gather kernel reads before the H2D copy lands.  Use a
+        # synchronous copy — index tensors are tiny so the cost is negligible.
+        alive_out = alive_out.to(device=x.device).long().contiguous()
         if alive_in is not None:
-            alive_in = alive_in.to(device=x.device, non_blocking=True).long()
+            alive_in = alive_in.to(device=x.device).long().contiguous()
             if alive_in.numel() == 0:
                 # All input channels dead -> output is zero everywhere.
                 return self._dense_linear(x) * 0.0
+
+        if _validate_enabled():
+            self._validate_indices(alive_out, alive_in, x)
 
         # ---- Gather --------------------------------------------------------
         W_small = self.weight.index_select(0, alive_out)
@@ -220,6 +244,52 @@ class GatherMatmulScatterLinear(nn.Module):
         idx_shape = [1] * (y_small.ndim - 1) + [alive_out.numel()]
         idx = alive_out.view(*idx_shape).expand_as(y_small)
         return out.scatter(-1, idx, y_small)
+
+    def _validate_indices(
+        self,
+        alive_out: torch.Tensor,
+        alive_in: Optional[torch.Tensor],
+        x: torch.Tensor,
+    ) -> None:
+        """Catch out-of-bounds alive indices BEFORE handing them to
+        index_select, with a clean Python error instead of a HIP HSA fault.
+
+        Forces a small device->host sync (.max().item()) — only enabled in
+        DEEP_CHAOS_GMS_VALIDATE=1 mode.  Disable once you've confirmed the
+        upstream scheduler is producing valid indices for your model.
+        """
+        out_dim = int(self.out_features)
+        in_dim = int(self.in_features)
+        out_max = int(alive_out.max().item())
+        out_min = int(alive_out.min().item())
+        if out_max >= out_dim or out_min < 0:
+            raise IndexError(
+                f"GMS [{self._component} layer={self._layer_idx}]: "
+                f"alive_out range [{out_min}, {out_max}] exceeds out_features={out_dim}. "
+                f"Numel={alive_out.numel()}. "
+                "This is the upstream scheduler producing an out-of-bounds index "
+                "(usually a head_dim/num_heads inference mismatch). On ROCm this "
+                "would otherwise manifest as a hard HIP HSA fault in "
+                "vectorized_gather_kernel. Fix the index generation in "
+                "DeepChaosScheduler.step()."
+            )
+        if alive_in is not None:
+            in_max = int(alive_in.max().item())
+            in_min = int(alive_in.min().item())
+            x_last = int(x.shape[-1])
+            if in_max >= in_dim or in_min < 0:
+                raise IndexError(
+                    f"GMS [{self._component} layer={self._layer_idx}]: "
+                    f"alive_in range [{in_min}, {in_max}] exceeds in_features={in_dim}. "
+                    f"Numel={alive_in.numel()}."
+                )
+            if in_max >= x_last:
+                raise IndexError(
+                    f"GMS [{self._component} layer={self._layer_idx}]: "
+                    f"alive_in max {in_max} exceeds input last-dim {x_last}. "
+                    f"This means the upstream output of the previous projection "
+                    f"is narrower than alive_in expects."
+                )
 
     def extra_repr(self) -> str:
         return (
