@@ -196,10 +196,10 @@ class GatherMatmulScatterLinear(nn.Module):
             x_small = x
         b_small = self.bias.index_select(0, alive_out) if self.bias is not None else None
 
-        # Insurance: index_select on dim>0 with an unsorted index can produce
-        # a non-contiguous tensor on some backends, and Triton tile loads
-        # (Phase 2) demand contiguous inputs.  .contiguous() on an
-        # already-contiguous tensor is a no-op.
+        # index_select on dim>0 with an unsorted index can produce a
+        # non-contiguous tensor on some backends; Triton tile loads demand
+        # contiguous inputs.  .contiguous() on an already-contiguous tensor
+        # is a no-op so this is safe unconditionally.
         W_small = W_small.contiguous()
         x_small = x_small.contiguous()
         if b_small is not None:

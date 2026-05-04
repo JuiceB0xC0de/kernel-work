@@ -1,7 +1,49 @@
+# Python
 __pycache__/
-*.pyc
-.pytest_cache/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Distribution / packaging
+*.egg
 *.egg-info/
-build/
 dist/
+build/
+wheels/
+sdist/
+.eggs/
+MANIFEST
+
+# Virtual environments
 .venv/
+venv/
+env/
+.env
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Triton cache
+~/.triton/
+
+# Benchmark outputs
+*.log
+*.json
+results/
