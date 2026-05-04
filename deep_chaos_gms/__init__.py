@@ -9,5 +9,12 @@ For auto-enable via the `DEEP_CHAOS_USE_GMS=1` environment variable, import
 """
 
 from .gms import GatherMatmulScatterLinear, disable_gms, enable_gms
+from .hoist import disable_hoist, enable_hoist
 
-__all__ = ["GatherMatmulScatterLinear", "enable_gms", "disable_gms"]
+__all__ = [
+    "GatherMatmulScatterLinear",
+    "disable_gms",
+    "disable_hoist",
+    "enable_gms",
+    "enable_hoist",
+]

@@ -30,7 +30,7 @@ from typing import Callable, List, Optional
 import torch
 import torch.nn as nn
 
-from deep_chaos_gms import disable_gms, enable_gms
+from deep_chaos_gms import disable_gms, disable_hoist, enable_gms, enable_hoist
 from deep_chaos_scheduler import DeepChaosConfig, DeepChaosScheduler
 
 
@@ -246,6 +246,12 @@ def main():
                         help="hidden size for the synthetic model")
     parser.add_argument("--skip-triton", action="store_true",
                         help="skip the gms-triton run (e.g. if Triton not installed)")
+    parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument("--skip-gms", action="store_true",
+                        help="skip both gms-torch and gms-triton runs")
+    parser.add_argument("--hoist", action="store_true",
+                        help="add a hoist run that physically yanks dead/identity/attn/mlp "
+                             "layers out of model.layers on every reshuffle")
     args = parser.parse_args()
 
     if args.device:
@@ -274,30 +280,36 @@ def main():
         scheduler = DeepChaosScheduler(model, config)
         return model, inp, target, scheduler
 
-    print("\nbaseline (post-hook):")
-    model, inp, target, scheduler = _build()
-    r_baseline = _run_train_bench("baseline", model, inp, target, scheduler,
-                                  device, args.steps, args.sticky, is_hf)
-    _print_result(r_baseline)
-    del model, scheduler
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    print("\ngms-torch:")
-    model, inp, target, scheduler = _build()
-    enable_gms(scheduler, backend="torch")
-    r_torch = _run_train_bench("gms-torch", model, inp, target, scheduler,
-                               device, args.steps, args.sticky, is_hf)
-    disable_gms(scheduler)
-    _print_result(r_torch)
-    del model, scheduler
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
+    r_baseline: Optional[TrainBenchResult] = None
+    r_torch: Optional[TrainBenchResult] = None
     r_triton: Optional[TrainBenchResult] = None
-    if not args.skip_triton:
+    r_hoist: Optional[TrainBenchResult] = None
+
+    if not args.skip_baseline:
+        print("\nbaseline (post-hook):")
+        model, inp, target, scheduler = _build()
+        r_baseline = _run_train_bench("baseline", model, inp, target, scheduler,
+                                      device, args.steps, args.sticky, is_hf)
+        _print_result(r_baseline)
+        del model, scheduler
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if not args.skip_gms:
+        print("\ngms-torch:")
+        model, inp, target, scheduler = _build()
+        enable_gms(scheduler, backend="torch")
+        r_torch = _run_train_bench("gms-torch", model, inp, target, scheduler,
+                                   device, args.steps, args.sticky, is_hf)
+        disable_gms(scheduler)
+        _print_result(r_torch)
+        del model, scheduler
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if not args.skip_triton and not args.skip_gms:
         print("\ngms-triton:")
         model, inp, target, scheduler = _build()
         enable_gms(scheduler, backend="triton")
@@ -305,21 +317,35 @@ def main():
                                     device, args.steps, args.sticky, is_hf)
         disable_gms(scheduler)
         _print_result(r_triton)
+        del model, scheduler
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if args.hoist:
+        print("\nhoist (yank dead layers):")
+        model, inp, target, scheduler = _build()
+        n_total = enable_hoist(scheduler)
+        print(f"  hoist installed on {n_total} layers")
+        r_hoist = _run_train_bench("hoist", model, inp, target, scheduler,
+                                   device, args.steps, args.sticky, is_hf)
+        disable_hoist(scheduler)
+        _print_result(r_hoist)
 
     # Verdict.
     print()
     print("=" * 78)
     print("VERDICT")
     print("=" * 78)
-    survived = [r.survived for r in (r_baseline, r_torch) + ((r_triton,) if r_triton else ())]
-    if all(survived):
+    runs = [r for r in (r_baseline, r_torch, r_triton, r_hoist) if r is not None]
+    if all(r.survived for r in runs):
         print("✓ All backends survived all shuffle boundaries.")
     else:
         print("✗ At least one backend crashed across a shuffle boundary.")
 
-    if r_baseline.total_seconds > 0:
-        for r in (r_torch, r_triton):
-            if r is None or not r.survived:
+    if r_baseline is not None and r_baseline.total_seconds > 0:
+        for r in runs:
+            if r is r_baseline or not r.survived:
                 continue
             speedup = r_baseline.total_seconds / r.total_seconds
             mem_delta = r.peak_mem_mb - r_baseline.peak_mem_mb
